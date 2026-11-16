@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Campo de flores neón</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,sans-serif}
+  canvas{display:block;width:100vw;height:100vh;cursor:pointer;touch-action:manipulation}
+  #hint{
+    position:fixed;left:0;right:0;bottom:22px;text-align:center;
+    color:#ff9be6;letter-spacing:.28em;text-transform:uppercase;font-size:13px;
+    text-shadow:0 0 8px #ff2bd6,0 0 22px #ff2bd6;pointer-events:none;
+    transition:opacity 1s;animation:pulse 2.2s infinite ease-in-out;
+  }
+  #hint.hide{opacity:0!important;animation:none}
+  @keyframes pulse{50%{opacity:.35}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">Haz clic para que florezca el campo</div>
+
+<script>
+/* ====================== Configuración básica ====================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const hint = document.getElementById('hint');
+const TAU = Math.PI * 2;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const rnd = (a, b) => a + Math.random() * (b - a);
+const ease = x => 1 - Math.pow(1 - x, 3);
+const back = x => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+const qb = (a, b, c, t) => (1 - t) * (1 - t) * a + 2 * (1 - t) * t * b + t * t * c;
+
+let W, H, dpr, unit;
+const flowers = [];
+let stars = [];
+let sparks = [];
+let opened = false;
+let camStart = 0, zoom = 1;            // cámara: se aleja poco a poco tras el clic
+const ZOOM_END = .52, ROSE_Y = .42;    // zoom final y posición vertical de la rosa
+
+const col = (h, l = 62, a = 1) => `hsla(${h},100%,${l}%,${a})`;
+const SB = b => b * dpr * Math.max(.6, unit);   // tamaño del brillo (glow)
+
+/* ====================== Pétalos y utilidades ====================== */
+function shape(c, len, w, mode) {
+  c.beginPath();
+  c.moveTo(0, 0);
+  if (mode === 'point') {
+    c.quadraticCurveTo(-w, -len * .55, 0, -len);
+    c.quadraticCurveTo(w, -len * .55, 0, 0);
+  } else if (mode === 'round') {
+    c.bezierCurveTo(-w * 1.25, -len * .15, -w * 1.15, -len * 1.08, 0, -len * .98);
+    c.bezierCurveTo(w * 1.15, -len * 1.08, w * 1.25, -len * .15, 0, 0);
+  } else {
+    c.bezierCurveTo(-w, -len * .3, -w * .8, -len * .92, 0, -len);
+    c.bezierCurveTo(w * .8, -len * .92, w, -len * .3, 0, 0);
+  }
+  c.closePath();
+}
+
+function petal(c, h, len, w, mode = 'soft', o = {}) {
+  const g = c.createLinearGradient(0, 0, 0, -len);
+  g.addColorStop(0, col(h, 6, .97));
+  g.addColorStop(1, col(h + (o.dh || 0), o.top || 26, .94));
+  shape(c, len, w, mode);
+  c.fillStyle = g;
+  c.shadowColor = col(h, 60);
+  c.shadowBlur = SB(o.blur || 14);
+  c.fill();
+  c.lineWidth = (o.lw || 2) * Math.max(.7, unit);
+  c.strokeStyle = col(h + (o.eh || 0), o.edge || 64);
+  c.stroke();
+  if (o.vein) {
+    c.shadowBlur = SB(6);
+    c.globalAlpha = .55;
+    c.beginPath(); c.moveTo(0, -len * .12); c.lineTo(0, -len * .82); c.stroke();
+    c.globalAlpha = 1;
+  }
+}
+
+function ring(c, n, rot, fn) {
+  for (let i = 0; i < n; i++) {
+    c.save();
+    c.rotate(rot + i * TAU / n);
+    fn(i);
+    c.restore();
+  }
+}
+
+function dot(c, x, y, r, h, l = 65, blur = 8) {
+  c.beginPath();
+  c.arc(x, y, Math.max(.6, r), 0, TAU);
+  c.fillStyle = col(h, l);
+  c.shadowColor = col(h, 60);
+  c.shadowBlur = SB(blur);
+  c.fill();
+}
+
+function disc(c, r, hFill, hEdge, blur = 16) {
+  c.beginPath();
+  c.arc(0, 0, r, 0, TAU);
+  c.fillStyle = col(hFill, 7);
+  c.shadowColor = col(hEdge, 60);
+  c.shadowBlur = SB(blur);
+  c.fill();
+  c.lineWidth = 2 * Math.max(.7, unit);
+  c.strokeStyle = col(hEdge, 62);
+  c.stroke();
+}
+
+/* ====================== La ROSA (se dibuja en vivo) ====================== */
+function drawRose(c, R, b, t) {
+  const rings = [
+    // [pétalos, largo, ancho, rotación]
+    [5, 1.00, .50, 0.00],
+    [5, .86, .48, .63],
+    [4, .72, .46, .30],
+    [4, .58, .44, .95],
+    [3, .44, .42, .20],
+    [3, .30, .40, 1.10]
+  ];
+
+  // aura neón detrás
+  c.save();
+  c.globalCompositeOperation = 'lighter';
+  const aura = c.createRadialGradient(0, 0, R * .1, 0, 0, R * 1.7);
+  aura.addColorStop(0, col(0, 50, .3 * b));
+  aura.addColorStop(1, col(0, 50, 0));
+  c.fillStyle = aura;
+  c.beginPath(); c.arc(0, 0, R * 1.7, 0, TAU); c.fill();
+  c.restore();
+
+  let lastP = 0;
+  rings.forEach((r, k) => {
+    const [n, L, Wd, rot] = r;
+    const st = (rings.length - 1 - k) * 0.1;        // florece desde el centro hacia afuera
+    const p = ease(clamp((b - st) / 0.45));
+    if (p <= 0) return;
+    if (k === rings.length - 1) lastP = p;
+    const h = k * 2;   // rojo neón puro (0°–10°)
+    const len = R * L * p, w = R * L * Wd * p;
+    c.save();
+    c.rotate(rot + (1 - p) * 1.4);
+    ring(c, n, 0, () => {
+      petal(c, h, len, w, 'round', { blur: 16, edge: 58, lw: 2.2, top: 24 + k * 2 });
+      // borde enrollado del pétalo (detalle)
+      c.beginPath();
+      c.arc(0, -len * .72, w * .78, Math.PI * 1.12, Math.PI * 1.88);
+      c.strokeStyle = col(h + 6, 64, .8);
+      c.lineWidth = 1.4 * Math.max(.7, unit);
+      c.shadowBlur = SB(8);
+      c.stroke();
+      // nervadura interior
+      c.beginPath();
+      c.moveTo(0, -len * .1); c.quadraticCurveTo(w * .12, -len * .4, 0, -len * .62);
+      c.globalAlpha = .45; c.stroke(); c.globalAlpha = 1;
+    });
+    c.restore();
+  });
+
+  // espiral del capullo central
+  if (lastP > 0) {
+    c.save();
+    c.rotate(.4);
+    c.beginPath();
+    for (let a = 0; a < 5 * Math.PI; a += .08) {
+      const r = R * .0105 * a * lastP;
+      const x = Math.cos(a) * r, y = Math.sin(a) * r;
+      a === 0 ? c.moveTo(x, y) : c.lineTo(x, y);
+    }
+    c.strokeStyle = col(0, 62);
+    c.lineWidth = 2 * Math.max(.7, unit);
+    c.shadowColor = col(0, 55);
+    c.shadowBlur = SB(12);
+    c.stroke();
+    c.restore();
+  }
+}
+
+/* ====================== Otras flores (se guardan como sprite) ====================== */
+const HEADS = {
+  sunflower(c, R, h) {
+    ring(c, 24, 0, () => petal(c, h, R, .16 * R, 'soft', { vein: 1, lw: 1.8, blur: 12 }));
+    ring(c, 24, TAU / 48, () => petal(c, h, R * .82, .15 * R, 'soft', { lw: 1.6, blur: 10, edge: 70 }));
+    disc(c, .42 * R, 25, 30);
+    for (let i = 0; i < 130; i++) {            // espiral de semillas (ángulo áureo)
+      const a = i * 2.39996, r = .4 * R * Math.sqrt(i / 130);
+      dot(c, Math.cos(a) * r, Math.sin(a) * r, R * .017, 38 + (i % 3) * 6, 62, 5);
+    }
+  },
+  daisy(c, R, h) {
+    ring(c, 20, 0, () => petal(c, h, R, .12 * R, 'soft', { vein: 1, lw: 1.7, blur: 12 }));
+    ring(c, 20, TAU / 40, () => petal(c, h, R * .84, .12 * R, 'soft', { lw: 1.5, blur: 10, edge: 72 }));
+    disc(c, .21 * R, 45, 52, 14);
+    for (let i = 0; i < 24; i++) {
+      const a = i * 2.39996, r = .19 * R * Math.sqrt(i / 24);
+      dot(c, Math.cos(a) * r, Math.sin(a) * r, R * .014, 50, 70, 4);
+    }
+  },
+  lily(c, R, h) {
+    ring(c, 3, 0, () => petal(c, h, R, .32 * R, 'point', { vein: 1, lw: 2, blur: 15 }));
+    ring(c, 3, TAU / 6, () => petal(c, h, R * .93, .3 * R, 'point', { vein: 1, lw: 2, blur: 15, edge: 70 }));
+    // estambres
+    ring(c, 6, .2, () => {
+      c.beginPath(); c.moveTo(0, 0); c.lineTo(0, -.52 * R);
+      c.strokeStyle = col(50, 70); c.lineWidth = 1.5 * Math.max(.7, unit);
+      c.shadowColor = col(50, 60); c.shadowBlur = SB(8); c.stroke();
+      dot(c, 0, -.54 * R, R * .045, 50, 68, 10);
+    });
+    dot(c, 0, 0, R * .06, h + 30, 70, 10);
+  },
+  lotus(c, R, h) {
+    ring(c, 12, 0, () => petal(c, h, R, .22 * R, 'point', { vein: 1, lw: 1.8, blur: 13 }));
+    ring(c, 8, TAU / 16, () => petal(c, h, R * .78, .24 * R, 'point', { vein: 1, lw: 1.8, blur: 13, edge: 70, dh: 15 }));
+    ring(c, 5, .3, () => petal(c, h, R * .55, .22 * R, 'point', { lw: 1.8, blur: 12, edge: 74, dh: 25 }));
+    dot(c, 0, 0, R * .1, 50, 62, 14);
+  },
+  poppy(c, R, h) {
+    ring(c, 5, 0, () => petal(c, h, R, .62 * R, 'round', { vein: 1, lw: 2, blur: 15 }));
+    ring(c, 5, TAU / 10, () => petal(c, h, R * .72, .5 * R, 'round', { lw: 2, blur: 13, edge: 70, dh: 10 }));
+    disc(c, .13 * R, 270, 285, 12);
+    ring(c, 16, 0, () => {
+      c.beginPath(); c.moveTo(0, -.13 * R); c.lineTo(0, -.3 * R);
+      c.strokeStyle = col(285, 72); c.lineWidth = 1.2 * Math.max(.7, unit);
+      c.shadowBlur = SB(6); c.stroke();
+      dot(c, 0, -.31 * R, R * .018, 285, 74, 5);
+    });
+  },
+  tulip(c, R, h) {
+    c.save(); c.rotate(-.42); petal(c, h, 1.2 * R, .4 * R, 'soft', { lw: 2, blur: 14 }); c.restore();
+    c.save(); c.rotate(.42);  petal(c, h, 1.2 * R, .4 * R, 'soft', { lw: 2, blur: 14 }); c.restore();
+    c.save(); c.rotate(-.18); petal(c, h, 1.3 * R, .45 * R, 'soft', { lw: 2, blur: 14, edge: 68 }); c.restore();
+    c.save(); c.rotate(.18);  petal(c, h, 1.3 * R, .45 * R, 'soft', { lw: 2, blur: 14, edge: 68 }); c.restore();
+    petal(c, h, 1.38 * R, .48 * R, 'soft', { vein: 1, lw: 2.2, blur: 16, edge: 72 });
+  },
+  lavender(c, R, h) {
+    for (let i = 0; i < 10; i++) {
+      const y = -i * .17 * R, s = 1 - i / 12;
+      [-1, 1].forEach(side => {
+        c.save(); c.translate(0, y); c.rotate(side * .95);
+        petal(c, h, .38 * R * s, .13 * R * s, 'soft', { lw: 1.6, blur: 10 });
+        c.restore();
+      });
+    }
+    c.save(); c.translate(0, -1.75 * R);
+    petal(c, h, .32 * R, .1 * R, 'soft', { lw: 1.6, blur: 10 });
+    c.restore();
+  }
+};
+
+/* ====================== Flores: creación ====================== */
+const TYPES = ['tulip', 'lily', 'sunflower', 'daisy', 'lotus', 'poppy', 'lavender'];
+// ninguna otra flor usa rojo: la rosa central es la única roja
+const PAL = {
+  tulip: [285, 195, 160, 260], lily: [300, 190, 270], sunflower: [48],
+  daisy: [175, 210, 150], lotus: [200, 280], poppy: [270, 210], lavender: [265, 240]
+};
+
+function make(type, nx, ny, delay = 0, m = 1) {
+  const pal = PAL[type] || [345];
+  const f = {
+    type, nx, ny, m,
+    hue: type === 'rose' ? 0 : pal[Math.floor(Math.random() * pal.length)],
+    born: performance.now() + delay,
+    ph: rnd(0, TAU),
+    bx: rnd(-.07, .07),
+    lean: rnd(-1, 1),
+    sprite: null, spR: 0
+  };
+  flowers.push(f);
+  flowers.sort((a, b) => a.ny - b.ny);
+  return f;
+}
+
+function spawnBatch() {
+  // Las flores brotan en círculos concéntricos alrededor de la rosa,
+  // cuando la cámara ya va a mitad de camino de alejarse.
+  const rings = [[8, 250], [13, 430], [18, 610]];   // [cantidad, radio]
+  const total = rings.reduce((s, r) => s + r[0], 0);
+  const list = [];
+  while (list.length < total) list.push(...TYPES.slice().sort(() => Math.random() - .5));
+  const cx0 = W / 2, cy0 = H * ROSE_Y;
+  let k = 0;
+  rings.forEach(([n, r], ri) => {
+    const off = rnd(0, TAU);
+    for (let i = 0; i < n; i++) {
+      const a = off + i * TAU / n + rnd(-.06, .06);
+      const rr = r * unit * rnd(.96, 1.04);
+      const x = cx0 + Math.cos(a) * rr, y = cy0 + Math.sin(a) * rr;
+      make(list[k++], x / W, y / H, 3500 + ri * 2200 + i * 320);
+    }
+  });
+}
+
+/* ====================== Partículas ====================== */
+function initStars() {
+  stars = Array.from({ length: Math.round(W * H / 20000) }, () => ({
+    x: rnd(0, W), y: rnd(0, H), vx: rnd(-.08, .08), vy: rnd(-.18, -.02),
+    r: rnd(.6, 1.8), h: rnd(0, 360), ph: rnd(0, TAU)
+  }));
+}
+function burst(x, y, n = 28) {
+  for (let i = 0; i < n; i++)
+    sparks.push({ x, y, a: rnd(0, TAU), s: rnd(1.5, 6) * unit, life: 1, h: rnd(280, 360) });
+}
+
+/* ====================== Dibujo de cada flor ====================== */
+function getSprite(f, R) {
+  if (f.sprite && f.spR === R) return f.sprite;
+  const pad = Math.ceil(R * 1.8);
+  const s = document.createElement('canvas');
+  s.width = s.height = 2 * pad * dpr;
+  const c = s.getContext('2d');
+  c.setTransform(dpr, 0, 0, dpr, pad * dpr, pad * dpr);
+  HEADS[f.type](c, R, f.hue);
+  f.sprite = { cv: s, pad };
+  f.spR = R;
+  return f.sprite;
+}
+
+function drawFlower(c, f, t) {
+  const age = t - f.born;
+  if (age < 0) return;
+  const isRose = f.type === 'rose';
+  const p = clamp(age / (isRose ? 3400 : 6500));
+  const tp = ease(clamp(p / .62));         // crecimiento del tallo
+  const b = clamp((p - .5) / .5);          // apertura de la flor
+  const depth = isRose ? 1 : (.7 + .6 * clamp(f.ny, 0, 1));
+  const R = (isRose ? 120 : 72) * unit * depth * f.m;
+
+  const sway = Math.sin(t * .0011 + f.ph) * 7 * unit;
+  const hx = f.nx * W + sway, hy = f.ny * H;
+  // la base del tallo siempre llega al borde inferior de la pantalla, aunque la cámara se aleje
+  const roseCY = H * ROSE_Y;
+  const bx = f.nx * W + f.bx * W, by = roseCY + (H + 40 - roseCY) / zoom;
+  const cx = (bx + hx) / 2 + f.lean * 60 * unit + sway * .5;
+  const cy = hy + (by - hy) * .55;
+
+  c.save();
+
+  // --- tallo (tubo neón) ---
+  const lw = Math.max(1.8, R * .04);
+  const path = (end) => {
+    c.beginPath();
+    for (let i = 0; i <= 30; i++) {
+      const tt = end * i / 30;
+      const x = qb(bx, cx, hx, tt), y = qb(by, cy, hy, tt);
+      i === 0 ? c.moveTo(x, y) : c.lineTo(x, y);
+    }
+  };
+  c.lineCap = 'round';
+  path(tp); c.strokeStyle = col(140, 14); c.lineWidth = lw * 1.8; c.stroke();
+  path(tp); c.strokeStyle = col(140, 60); c.lineWidth = lw * .7;
+  c.shadowColor = col(140, 55); c.shadowBlur = SB(12); c.stroke();
+  c.shadowBlur = 0;
+
+  const tangent = tt => {
+    const dx = 2 * ((1 - tt) * (cx - bx) + tt * (hx - cx));
+    const dy = 2 * ((1 - tt) * (cy - by) + tt * (hy - cy));
+    return Math.atan2(dx, -dy);
+  };
+
+  // --- hojas ---
+  [[.36, 1], [.55, -1], [.74, 1]].forEach(([t0, side]) => {
+    if (tp <= t0) return;
+    const lp = ease(clamp((tp - t0) / .2));
+    c.save();
+    c.translate(qb(bx, cx, hx, t0), qb(by, cy, hy, t0));
+    c.rotate(tangent(t0) + side * 1.1);
+    petal(c, 140, Math.max(24 * unit, R * .62) * lp, Math.max(9 * unit, R * .2) * lp, 'point',
+          { vein: 1, blur: 10, lw: 1.6, edge: 60 });
+    c.restore();
+  });
+
+  // --- espinas (solo la rosa) ---
+  if (isRose) {
+    [.3, .45, .6, .75, .88].forEach((t0, i) => {
+      if (tp <= t0) return;
+      c.save();
+      c.translate(qb(bx, cx, hx, t0), qb(by, cy, hy, t0));
+      c.rotate(tangent(t0) + (i % 2 ? -1 : 1) * 1.2);
+      c.beginPath(); c.moveTo(0, 0); c.lineTo(0, -10 * unit);
+      c.strokeStyle = col(140, 68); c.lineWidth = 1.8 * Math.max(.7, unit);
+      c.shadowColor = col(140, 55); c.shadowBlur = SB(6); c.stroke();
+      c.restore();
+    });
+  }
+
+  // --- cabeza de la flor ---
+  if (b > 0) {
+    c.shadowBlur = 0;
+    c.translate(hx, hy);
+    if (isRose) {
+      c.rotate(Math.sin(t * .0006) * .04);
+      drawRose(c, R, b, t);
+    } else {
+      const sp = getSprite(f, R);
+      const sc = Math.max(0, back(b));
+      c.rotate(sway * .01 + (1 - b) * 1.5);
+      c.scale(sc, sc);
+      c.drawImage(sp.cv, -sp.pad, -sp.pad, 2 * sp.pad, 2 * sp.pad);
+    }
+  }
+  c.restore();
+}
+
+/* ====================== Bucle principal ====================== */
+function frame(t) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  // resplandor suave del suelo
+  const g = ctx.createLinearGradient(0, H * .72, 0, H);
+  g.addColorStop(0, 'rgba(0,255,150,0)');
+  g.addColorStop(1, 'rgba(0,255,150,.08)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, H * .72, W, H * .28);
+
+  // luciérnagas neón
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  stars.forEach(s => {
+    s.x += s.vx; s.y += s.vy;
+    if (s.y < -10) { s.y = H + 10; s.x = rnd(0, W); }
+    if (s.x < -10) s.x = W + 10; if (s.x > W + 10) s.x = -10;
+    const a = .35 + .65 * Math.abs(Math.sin(t * .001 + s.ph));
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r * Math.max(.8, unit), 0, TAU);
+    ctx.fillStyle = col(s.h, 70, a);
+    ctx.shadowColor = col(s.h, 60);
+    ctx.shadowBlur = 8 * dpr;
+    ctx.fill();
+  });
+  ctx.restore();
+
+  // cámara: se aleja suavemente desde la rosa (que se queda en su lugar)
+  if (camStart) {
+    const x = clamp((t - camStart) / 7000);
+    zoom = 1 - (1 - ZOOM_END) * (x * x * (3 - 2 * x));
+  }
+  const cx0 = W / 2, cy0 = H * ROSE_Y;
+  ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * cx0 * (1 - zoom), dpr * cy0 * (1 - zoom));
+
+  // flores (ordenadas por profundidad)
+  flowers.forEach(f => drawFlower(ctx, f, t));
+
+  // chispas de los clics
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  sparks = sparks.filter(s => s.life > 0);
+  sparks.forEach(s => {
+    s.x += Math.cos(s.a) * s.s; s.y += Math.sin(s.a) * s.s + .3;
+    s.s *= .955; s.life -= .018;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 2.2 * Math.max(.8, unit), 0, TAU);
+    ctx.fillStyle = col(s.h, 70, Math.max(0, s.life));
+    ctx.shadowColor = col(s.h, 60);
+    ctx.shadowBlur = 10 * dpr;
+    ctx.fill();
+  });
+  ctx.restore();
+
+  requestAnimationFrame(frame);
+}
+
+/* ====================== Interacción ====================== */
+cv.addEventListener('pointerdown', e => {
+  if (!opened) {
+    opened = true;
+    burst(W / 2, H * .42, 40);
+    camStart = performance.now();
+    spawnBatch();
+    hint.textContent = 'Sigue haciendo clic para plantar más flores';
+    setTimeout(() => hint.classList.add('hide'), 4500);
+  } else {
+    const type = TYPES[Math.floor(Math.random() * TYPES.length)];
+    // convertir el clic (pantalla) a coordenadas del mundo, según el zoom actual
+    const wx = W / 2 + (e.clientX - W / 2) / zoom;
+    const wy = H * ROSE_Y + (e.clientY - H * ROSE_Y) / zoom;
+    make(type, wx / W, wy / H);
+    burst(wx, wy, 22);
+  }
+});
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  unit = Math.min(W, H) / 700;
+  flowers.forEach(f => f.sprite = null);
+  initStars();
+}
+addEventListener('resize', resize);
+
+resize();
+make('rose', .5, .42, 300);    // la rosa aparece al iniciar
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
